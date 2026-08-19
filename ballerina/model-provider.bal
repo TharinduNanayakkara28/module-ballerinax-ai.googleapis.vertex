@@ -239,6 +239,52 @@ public isolated distinct client class ModelProvider {
         'class: "io.ballerina.lib.ai.googleapis.vertex.Generator"
     } external;
 
+    # Sends a streaming chat request to the model. The request is routed to the correct
+    # publisher-specific streaming endpoint and wire format.
+    #
+    # + messages - List of chat messages or a single user message
+    # + tools - Tool definitions to be used for tool calling
+    # + stop - Stop sequence to stop the completion
+    # + return - A stream of chat completion chunks, or an error if the request fails
+    remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools = [], string? stop = ())
+            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        map<string> headers = {"Content-Type": "application/json"};
+        if self.auth is ServiceAccountConfig {
+            string|ai:Error accessToken = self.getAccessToken();
+            if accessToken is ai:Error {
+                return accessToken;
+            }
+            headers["Authorization"] = string `Bearer ${accessToken}`;
+        }
+
+        if self.publisher == ANTHROPIC {
+            string path = buildStreamPath(self.projectId, self.location, self.modelType, self.publisher);
+            return self.chatStreamAnthropic(messages, tools, stop, path, headers);
+        } else if self.publisher == MISTRAL {
+            string path = buildStreamPath(self.projectId, self.location, self.modelType, self.publisher);
+            return self.chatStreamOpenAiCompat(messages, tools, stop, path, headers);
+        } else if isOpenModelPublisher(self.publisher) {
+            string path = buildOpenModelsPath(self.projectId, self.location);
+            return self.chatStreamOpenAiCompat(messages, tools, stop, path, headers);
+        } else {
+            string path = buildStreamPath(self.projectId, self.location, self.modelType, self.publisher) + "?alt=sse";
+            return self.chatStreamGemini(messages, tools, stop, path, headers);
+        }
+    }
+
+    # Sends a streaming prompt to the model and streams back the generated text.
+    # Only `string` is supported as the expected type.
+    #
+    # + prompt - The prompt to use in the request
+    # + td - The expected type of the streamed value; must be `string`
+    # + return - A stream of the generated value, or an error if the type is unsupported
+    remote function generateStream(ai:Prompt prompt,
+            @display {label: "Expected type"} typedesc<anydata> td = <>)
+            returns stream<td, ai:Error?>|ai:Error = @java:Method {
+        'class: "io.ballerina.lib.ai.googleapis.vertex.StreamGenerator"
+    } external;
+
     // ── Private publisher-specific chat implementations ───────────────────────
 
     private isolated function executeGeminiChat(ai:ChatMessage[]|ai:ChatUserMessage messages,
@@ -359,5 +405,260 @@ public isolated distinct client class ModelProvider {
             inputTokens: response.usage?.prompt_tokens,
             outputTokens: response.usage?.completion_tokens
         };
+    }
+
+    // ── Private publisher-specific streaming implementations ──────────────────
+
+    private function chatStreamGemini(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools, string? stop,
+            string path, map<string> headers) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        var [contents, systemInstruction] = check convertMessagesToVertexAiContents(messages);
+
+        VertexAiGenerationConfig generationConfig = {maxOutputTokens: self.maxTokens};
+        decimal? temp = self.temperature;
+        if temp is decimal {
+            generationConfig.temperature = temp;
+        }
+        if stop is string {
+            generationConfig.stopSequences = [stop];
+        }
+
+        map<json> requestPayload = {
+            "contents": contents.toJson(),
+            "generationConfig": generationConfig.toJson()
+        };
+        if systemInstruction is VertexAiSystemInstruction {
+            requestPayload["systemInstruction"] = systemInstruction.toJson();
+        }
+        if tools.length() > 0 {
+            requestPayload["tools"] = mapToVertexAiTools(tools).toJson();
+        }
+
+        http:Response|error response = self.vertexAiClient->post(path, requestPayload, headers);
+        if response is error {
+            return buildHttpError(response);
+        }
+        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+        if sseStream is error {
+            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
+        }
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream));
+        return chunkStream;
+    }
+
+    private function chatStreamAnthropic(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools, string? stop,
+            string path, map<string> headers) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        var [anthropicMessages, systemPrompt] = check convertMessagesToAnthropicMessages(messages);
+
+        AnthropicTool[] anthropicTools = mapToAnthropicTools(tools);
+        map<json> requestPayload = buildAnthropicPayload(
+            anthropicMessages, systemPrompt, anthropicTools, (),
+            self.maxTokens, self.temperature, stop);
+        requestPayload["stream"] = true;
+
+        http:Response|error response = self.vertexAiClient->post(path, requestPayload, headers);
+        if response is error {
+            return buildHttpError(response);
+        }
+        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+        if sseStream is error {
+            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
+        }
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new AnthropicChunkIterator(sseStream));
+        return chunkStream;
+    }
+
+    private function chatStreamOpenAiCompat(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools, string? stop,
+            string path, map<string> headers) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        MistralMessage[]|ai:Error mistralMessages = convertMessagesToMistralMessages(messages);
+        if mistralMessages is ai:Error {
+            return mistralMessages;
+        }
+
+        MistralTool[] mistralTools = mapToMistralTools(tools);
+        string modelId = string `${self.publisher}/${self.modelType}`;
+        map<json> requestPayload = buildMistralPayload(
+            modelId, mistralMessages, mistralTools, (),
+            self.maxTokens, self.temperature, stop);
+        requestPayload["stream"] = true;
+
+        http:Response|error response = self.vertexAiClient->post(path, requestPayload, headers);
+        if response is error {
+            return buildHttpError(response);
+        }
+        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+        if sseStream is error {
+            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
+        }
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new OpenAiCompatChunkIterator(sseStream));
+        return chunkStream;
+    }
+}
+
+# Iterator that converts Vertex AI Gemini's Server-Sent Event stream into a stream of
+# normalized `ai:ChatCompletionChunk` values. Each `data:` line is parsed as a partial
+# `VertexAiResponse` and mapped via `toAiChunkGemini`; blank lines and unparseable
+# keep-alive comments are skipped. Gemini has no `[DONE]` sentinel — the stream simply
+# closes when generation finishes.
+class GeminiChunkIterator {
+    private stream<http:SseEvent, error?> sseStream;
+
+    isolated function init(stream<http:SseEvent, error?> sseStream) {
+        self.sseStream = sseStream;
+    }
+
+    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        while true {
+            record {|http:SseEvent value;|}|error? event = self.sseStream.next();
+            if event is () {
+                return ();
+            }
+            if event is error {
+                return error ai:Error("Error while reading the model stream", event);
+            }
+            string? data = event.value.data;
+            if data is () {
+                continue;
+            }
+            string trimmedData = data.trim();
+            if trimmedData == "" {
+                continue;
+            }
+            json|error payload = trimmedData.fromJsonString();
+            if payload is error {
+                continue;
+            }
+            VertexAiResponse|error wireChunk = payload.cloneWithType();
+            if wireChunk is error {
+                continue;
+            }
+            return {value: toAiChunkGemini(wireChunk)};
+        }
+    }
+
+    public isolated function close() returns ai:Error? {
+        error? result = self.sseStream.close();
+        if result is error {
+            return error ai:Error("Error while closing the model stream", result);
+        }
+        return ();
+    }
+}
+
+# Iterator that converts the Anthropic (on Vertex `:streamRawPredict`) Server-Sent Event
+# stream into a stream of normalized `ai:ChatCompletionChunk` values. Each event is parsed
+# into an `AnthropicStreamEvent` and mapped via `toAiChunkAnthropicEvent`; the prompt token
+# count captured from `message_start` is threaded through so the `message_delta` chunk can
+# report full usage. The stream ends on `message_stop` or when the underlying SSE stream closes.
+class AnthropicChunkIterator {
+    private stream<http:SseEvent, error?> sseStream;
+    private int? promptTokens = ();
+
+    isolated function init(stream<http:SseEvent, error?> sseStream) {
+        self.sseStream = sseStream;
+    }
+
+    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        while true {
+            record {|http:SseEvent value;|}|error? event = self.sseStream.next();
+            if event is () {
+                return ();
+            }
+            if event is error {
+                return error ai:Error("Error while reading the model stream", event);
+            }
+            string? data = event.value.data;
+            if data is () {
+                continue;
+            }
+            string trimmedData = data.trim();
+            if trimmedData == "" {
+                continue;
+            }
+            json|error payload = trimmedData.fromJsonString();
+            if payload is error {
+                continue;
+            }
+            AnthropicStreamEvent|error wireEvent = payload.cloneWithType();
+            if wireEvent is error {
+                continue;
+            }
+            if wireEvent.'type == "error" {
+                return error ai:Error("Error event received from the Anthropic stream");
+            }
+            if wireEvent.'type == "message_start" {
+                self.promptTokens = wireEvent.message?.usage?.input_tokens;
+            }
+            ai:ChatCompletionChunk? chunk = toAiChunkAnthropicEvent(wireEvent, self.promptTokens);
+            if chunk is ai:ChatCompletionChunk {
+                return {value: chunk};
+            }
+            if wireEvent.'type == "message_stop" {
+                return ();
+            }
+        }
+    }
+
+    public isolated function close() returns ai:Error? {
+        error? result = self.sseStream.close();
+        if result is error {
+            return error ai:Error("Error while closing the model stream", result);
+        }
+        return ();
+    }
+}
+
+# Iterator that converts a streamed OpenAI-compatible Server-Sent Event stream (used by the
+# Mistral `:streamRawPredict` endpoint and the open-models `openapi/chat/completions`
+# endpoint) into a stream of normalized `ai:ChatCompletionChunk` values. Each `data:` line is
+# parsed into the wire chunk and mapped via `toAiChunkOpenAiCompat`; the terminating `[DONE]`
+# sentinel, blank lines, and unparseable keep-alive comments are skipped.
+class OpenAiCompatChunkIterator {
+    private stream<http:SseEvent, error?> sseStream;
+
+    isolated function init(stream<http:SseEvent, error?> sseStream) {
+        self.sseStream = sseStream;
+    }
+
+    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        while true {
+            record {|http:SseEvent value;|}|error? event = self.sseStream.next();
+            if event is () {
+                return ();
+            }
+            if event is error {
+                return error ai:Error("Error while reading the model stream", event);
+            }
+            string? data = event.value.data;
+            if data is () {
+                continue;
+            }
+            string trimmedData = data.trim();
+            if trimmedData == "" {
+                continue;
+            }
+            if trimmedData == "[DONE]" {
+                return ();
+            }
+            json|error payload = trimmedData.fromJsonString();
+            if payload is error {
+                continue;
+            }
+            MistralStreamChunk|error wireChunk = payload.cloneWithType();
+            if wireChunk is error {
+                continue;
+            }
+            return {value: toAiChunkOpenAiCompat(wireChunk)};
+        }
+    }
+
+    public isolated function close() returns ai:Error? {
+        error? result = self.sseStream.close();
+        if result is error {
+            return error ai:Error("Error while closing the model stream", result);
+        }
+        return ();
     }
 }

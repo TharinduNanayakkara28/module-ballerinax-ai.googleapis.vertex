@@ -49,6 +49,15 @@ isolated function buildOpenModelsPath(string projectId, string location) returns
     return string `/v1beta1/projects/${projectId}/locations/${location}/endpoints/openapi/chat/completions`;
 }
 
+isolated function buildStreamPath(string projectId, string location,
+        string modelType, string publisher) returns string {
+    // Google Gemini → :streamGenerateContent (needs ?alt=sse, added by the caller)
+    // Anthropic / Mistral on Vertex → :streamRawPredict
+    string suffix = publisher == ANTHROPIC || publisher == MISTRAL
+        ? ":streamRawPredict" : ":streamGenerateContent";
+    return string `/v1/projects/${projectId}/locations/${location}/publishers/${publisher}/models/${modelType}${suffix}`;
+}
+
 # Returns true when the publisher routes to the OpenAI-compatible open-models endpoint.
 # Covers Meta, DeepSeek, Qwen, Kimi, and MiniMax hosted on Vertex AI Model Garden.
 isolated function isOpenModelPublisher(string publisher) returns boolean {
@@ -621,6 +630,60 @@ isolated function convertMessageToJson(ai:ChatMessage[]|ai:ChatMessage messages)
 }
 
 // ── HTTP error helper ─────────────────────────────────────────────────────────
+
+// ── generateStream() orchestration ──────────────────────────────────────────
+
+# Builds the string stream behind the dependently-typed `generateStream`. The
+# native `StreamGenerator` shim trampolines here so the type gating stays in
+# Ballerina. Only `string` is supported; other types yield an error because a
+# partial generation is a valid value only for `string`. When valid, the
+# underlying `chatStream` chunks are projected onto their text fragments.
+#
+# + llmModel - The model provider whose `chatStream` supplies the chunks
+# + prompt - The prompt to send to the model
+# + td - The caller's expected type; must be `string`
+# + return - A stream of text fragments, or an error if the type is unsupported
+function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typedesc<anydata> td)
+        returns stream<string, ai:Error?>|ai:Error {
+    if td !is typedesc<string> {
+        return error ai:Error("This data type is not supported for streaming. " +
+            "'generateStream' supports only 'string'; use 'generate' for structured types.");
+    }
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check llmModel->chatStream({role: ai:USER, content: prompt});
+    stream<string, ai:Error?> textStream = new (new ChunkTextIterator(chunks));
+    return textStream;
+}
+
+# Projects a normalized `ai:ChatCompletionChunk` stream onto its text content,
+# yielding each non-empty `delta.content` fragment and skipping tool-call and
+# usage-only chunks. Backs `generateLlmResponseStream`.
+class ChunkTextIterator {
+    private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
+
+    isolated function init(stream<ai:ChatCompletionChunk, ai:Error?> chunks) {
+        self.chunks = chunks;
+    }
+
+    public isolated function next() returns record {|string value;|}|ai:Error? {
+        while true {
+            record {|ai:ChatCompletionChunk value;|}|ai:Error? next = self.chunks.next();
+            if next is () {
+                return ();
+            }
+            if next is ai:Error {
+                return next;
+            }
+            ai:ChatCompletionChunkChoice[] choices = next.value.choices;
+            if choices.length() == 0 {
+                continue;
+            }
+            string? content = choices[0].delta.content;
+            if content is string && content.length() > 0 {
+                return {value: content};
+            }
+        }
+    }
+}
 
 isolated function buildHttpError(error httpError) returns ai:LlmConnectionError {
     if httpError is http:ApplicationResponseError {

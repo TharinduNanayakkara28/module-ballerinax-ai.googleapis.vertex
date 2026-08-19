@@ -9,6 +9,12 @@ org = "ballerinax"
 repository = "https://github.com/ballerina-platform/module-ballerinax-ai.googleapis.vertex"
 version = "1.0.1"
 
+[[dependency]]
+org = "ballerina"
+name = "ai"
+version = "1.13.0"
+repository = "local"
+
 [platform.java21]
 graalvmCompatible = true
 
