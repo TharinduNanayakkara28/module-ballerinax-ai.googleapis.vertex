@@ -86,10 +86,22 @@ final ai:ChatCompletionFunctions WEATHER_TOOL = {
     }
 };
 
+// Drains the stream with explicit `next()` calls rather than a query expression: a
+// `check from ... in chunks` pipeline surfaces the *cause* of a stream error instead of
+// the error itself, so the `ai:` error type the connector reports would be lost here and
+// the failure-path assertions below could not tell one failure from another.
 isolated function collectStream(stream<ai:ChatCompletionChunk, ai:Error?> chunks) returns StreamResult|ai:Error {
     StreamResult result = {};
-    check from ai:ChatCompletionChunk chunk in chunks
-        do {
+    while true {
+        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = chunks.next();
+        if next is () {
+            break;
+        }
+        if next is ai:Error {
+            return next;
+        }
+        ai:ChatCompletionChunk chunk = next.value;
+        {
             result.chunkCount += 1;
             if chunk.choices.length() > 0 {
                 ai:ChatCompletionChunkChoice choice = chunk.choices[0];
@@ -129,16 +141,25 @@ isolated function collectStream(stream<ai:ChatCompletionChunk, ai:Error?> chunks
             if u is ai:CompletionTokenUsage {
                 result.usage = u;
             }
-        };
+        }
+    }
     return result;
 }
 
+// Drains the text stream with explicit `next()` calls, for the same reason as
+// `collectStream` above: a query expression would replace the reported error with its cause.
 isolated function collectText(stream<string, ai:Error?> fragments) returns string|ai:Error {
     string text = "";
-    check from string fragment in fragments
-        do {
-            text += fragment;
-        };
+    while true {
+        record {|string value;|}|ai:Error? next = fragments.next();
+        if next is () {
+            break;
+        }
+        if next is ai:Error {
+            return next;
+        }
+        text += next.value;
+    }
     return text;
 }
 
@@ -293,4 +314,143 @@ isolated function getToolCall(StreamResult result, string index) returns Accumul
 
 isolated function parseArgs(string args) returns map<json>|error {
     return args.fromJsonStringWithType();
+}
+
+// ── Failure paths and edge cases ────────────────────────────────────────────
+// The scenarios above all describe a well-behaved endpoint. These cover what the
+// happy-path suite cannot see: a rejected request, a generation cut short mid-stream,
+// a garbled frame, tool-call indexing across events, and stream closing.
+
+const GEMINI_STREAM_HTTP_ERROR_URL = "http://localhost:8097/llm/vertexai";
+const GEMINI_STREAM_MIDSTREAM_ERROR_URL = "http://localhost:8098/llm/vertexai";
+const GEMINI_STREAM_MALFORMED_URL = "http://localhost:8099/llm/vertexai";
+const GEMINI_STREAM_PARALLEL_TOOL_URL = "http://localhost:8100/llm/vertexai";
+const ANTHROPIC_STREAM_ERROR_EVENT_URL = "http://localhost:8101/llm/vertexai";
+const OPEN_MODEL_STREAM_USAGE_URL = "http://localhost:8102/llm/vertexai";
+
+// A non-2xx must surface as an error carrying the status and the API's own message.
+// The streaming POST binds to `http:Response`, which turns off the client's status-code
+// error mapping, so without an explicit check a 429 reads as an empty successful stream.
+@test:Config
+function testChatStreamSurfacesHttpErrorStatus() returns error? {
+    ModelProvider p = check new (TEST_AUTH, PROJECT_ID, GEMINI_2_0_FLASH, LOCATION, GEMINI_STREAM_HTTP_ERROR_URL);
+    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result = p->chatStream([{role: ai:USER, content: "Say hello"}]);
+
+    test:assertTrue(result is ai:Error, "a 429 from the model must fail chatStream, not open an empty stream");
+    if result is ai:Error {
+        string message = result.message();
+        test:assertTrue(message.includes("429"), "the status code must reach the caller: " + message);
+        test:assertTrue(message.includes("Quota exceeded"),
+                "the model's own message must reach the caller: " + message);
+    }
+}
+
+// The same check must guard generateStream, which opens the stream through chatStream.
+@test:Config
+function testGenerateStreamSurfacesHttpErrorStatus() returns error? {
+    ModelProvider p = check new (TEST_AUTH, PROJECT_ID, GEMINI_2_0_FLASH, LOCATION, GEMINI_STREAM_HTTP_ERROR_URL);
+    stream<string, ai:Error?>|ai:Error result = p->generateStream(`Say hello`);
+    test:assertTrue(result is ai:Error, "a 429 from the model must fail generateStream");
+}
+
+// An `{"error": ...}` frame arriving mid-generation must fail the stream. Skipping it
+// would end iteration normally and hand back "Hello" as if it were the whole answer.
+@test:Config
+function testGeminiChatStreamFailsOnMidStreamErrorFrame() returns error? {
+    ModelProvider p = check new (TEST_AUTH, PROJECT_ID, GEMINI_2_0_FLASH, LOCATION,
+        GEMINI_STREAM_MIDSTREAM_ERROR_URL);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check p->chatStream([{role: ai:USER, content: "Say hello"}]);
+    StreamResult|ai:Error result = collectStream(chunks);
+
+    test:assertTrue(result is ai:Error, "a mid-stream error frame must not end the stream cleanly");
+    if result is ai:Error {
+        test:assertTrue(result.message().includes("Resource exhausted mid-generation"),
+                "the mid-stream failure detail must reach the caller: " + result.message());
+    }
+}
+
+// A frame that is not JSON at all is a broken stream, not something to skip past.
+@test:Config
+function testGeminiChatStreamFailsOnMalformedFrame() returns error? {
+    ModelProvider p = check new (TEST_AUTH, PROJECT_ID, GEMINI_2_0_FLASH, LOCATION, GEMINI_STREAM_MALFORMED_URL);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check p->chatStream([{role: ai:USER, content: "Say hello"}]);
+    StreamResult|ai:Error result = collectStream(chunks);
+
+    test:assertTrue(result is ai:Error, "a malformed frame must fail the stream");
+    if result is ai:Error {
+        test:assertTrue(result is ai:LlmInvalidResponseError,
+                "a malformed frame is an invalid response: " + result.message());
+    }
+}
+
+// Anthropic reports mid-stream failures as an `error` event; its `type` is what tells a
+// retryable overload apart from a terminal bad request, so both parts must survive.
+@test:Config
+function testAnthropicChatStreamSurfacesErrorEvent() returns error? {
+    ModelProvider p = check new (TEST_AUTH, PROJECT_ID, "anthropic/claude-test-model", LOCATION,
+        ANTHROPIC_STREAM_ERROR_EVENT_URL);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check p->chatStream([{role: ai:USER, content: "Say hello"}]);
+    StreamResult|ai:Error result = collectStream(chunks);
+
+    test:assertTrue(result is ai:Error, "an Anthropic error event must fail the stream");
+    if result is ai:Error {
+        string message = result.message();
+        test:assertTrue(message.includes("overloaded_error"), "the error type must reach the caller: " + message);
+        test:assertTrue(message.includes("Overloaded"), "the error message must reach the caller: " + message);
+    }
+}
+
+// Two function calls arriving in separate events must get distinct tool-call indices:
+// a consumer accumulating by index would otherwise splice their arguments together.
+@test:Config
+function testGeminiChatStreamIndexesToolCallsAcrossChunks() returns error? {
+    ModelProvider p = check new (TEST_AUTH, PROJECT_ID, GEMINI_2_0_FLASH, LOCATION,
+        GEMINI_STREAM_PARALLEL_TOOL_URL);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check p->chatStream(
+        [{role: ai:USER, content: "Weather in Colombo and Kandy?"}], [WEATHER_TOOL]);
+    StreamResult result = check collectStream(chunks);
+
+    test:assertEquals(result.toolCalls.length(), 2, "each function call needs its own index");
+    AccumulatedToolCall first = check getToolCall(result, "0");
+    AccumulatedToolCall second = check getToolCall(result, "1");
+    test:assertEquals(check parseArgs(first.args), {"city": "Colombo"});
+    test:assertEquals(check parseArgs(second.args), {"city": "Kandy"});
+}
+
+// A usage-only final chunk carries no choices; it must still be mapped, and the
+// `total_tokens` the endpoint reports must be carried through rather than dropped.
+@test:Config
+function testOpenModelChatStreamMapsUsageOnlyChunk() returns error? {
+    ModelProvider p = check new (TEST_AUTH, PROJECT_ID, "deepseek-ai/deepseek-test-model", LOCATION,
+        OPEN_MODEL_STREAM_USAGE_URL);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check p->chatStream([{role: ai:USER, content: "Say hi"}]);
+    StreamResult result = check collectStream(chunks);
+
+    test:assertEquals(result.text, "Hi there!");
+    test:assertEquals(result.usage, {promptTokens: 4, completionTokens: 6, totalTokens: 10});
+}
+
+// Closing the chunk stream must close the underlying SSE stream and release its
+// connection, and must stay safe to call after the stream has already ended.
+@test:Config
+function testChatStreamCloseReleasesTheStream() returns error? {
+    ModelProvider p = <ModelProvider>geminiStreamTextProvider;
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check p->chatStream([{role: ai:USER, content: "Say hello"}]);
+    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = chunks.next();
+    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "expected a first chunk");
+
+    check chunks.close();
+    check chunks.close();
+}
+
+// generateStream's text projection wraps the chunk stream, so closing it has to reach
+// through to the chat stream underneath rather than stopping at the wrapper.
+@test:Config
+function testGenerateStreamCloseReleasesTheStream() returns error? {
+    ModelProvider p = <ModelProvider>geminiStreamTextProvider;
+    stream<string, ai:Error?> fragments = check p->generateStream(`Say hello`);
+    record {|string value;|}|ai:Error? first = fragments.next();
+    test:assertTrue(first is record {|string value;|}, "expected a first text fragment");
+
+    check fragments.close();
 }

@@ -249,28 +249,52 @@ public isolated distinct client class ModelProvider {
     remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
             returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        observe:ChatSpan span = observe:createChatSpan(self.modelType);
+        span.addProvider(self.publisher);
+        decimal? temp = self.temperature;
+        if temp is decimal {
+            span.addTemperature(temp);
+        }
+        json|ai:Error inputMessage = convertMessageToJson(messages);
+        if inputMessage is json {
+            span.addInputMessages(inputMessage);
+        }
+        if stop is string {
+            span.addStopSequence(stop);
+        }
+        if tools.length() > 0 {
+            span.addTools(tools);
+        }
+
         map<string> headers = {"Content-Type": "application/json"};
         if self.auth is ServiceAccountConfig {
             string|ai:Error accessToken = self.getAccessToken();
             if accessToken is ai:Error {
+                span.close(accessToken);
                 return accessToken;
             }
             headers["Authorization"] = string `Bearer ${accessToken}`;
         }
 
+        stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result;
         if self.publisher == ANTHROPIC {
             string path = buildStreamPath(self.projectId, self.location, self.modelType, self.publisher);
-            return self.chatStreamAnthropic(messages, tools, stop, path, headers);
+            result = self.chatStreamAnthropic(messages, tools, stop, path, headers, span);
         } else if self.publisher == MISTRAL {
             string path = buildStreamPath(self.projectId, self.location, self.modelType, self.publisher);
-            return self.chatStreamOpenAiCompat(messages, tools, stop, path, headers);
+            result = self.chatStreamOpenAiCompat(messages, tools, stop, path, headers, span);
         } else if isOpenModelPublisher(self.publisher) {
             string path = buildOpenModelsPath(self.projectId, self.location);
-            return self.chatStreamOpenAiCompat(messages, tools, stop, path, headers);
+            result = self.chatStreamOpenAiCompat(messages, tools, stop, path, headers, span);
         } else {
             string path = buildStreamPath(self.projectId, self.location, self.modelType, self.publisher) + "?alt=sse";
-            return self.chatStreamGemini(messages, tools, stop, path, headers);
+            result = self.chatStreamGemini(messages, tools, stop, path, headers, span);
         }
+
+        if result is ai:Error {
+            span.close(result);
+        }
+        return result;
     }
 
     # Sends a streaming prompt to the model and streams back the generated text.
@@ -410,8 +434,8 @@ public isolated distinct client class ModelProvider {
     // ── Private publisher-specific streaming implementations ──────────────────
 
     private function chatStreamGemini(ai:ChatMessage[]|ai:ChatUserMessage messages,
-            ai:ChatCompletionFunctions[] tools, string? stop,
-            string path, map<string> headers) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+            ai:ChatCompletionFunctions[] tools, string? stop, string path, map<string> headers,
+            observe:ChatSpan span) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
         var [contents, systemInstruction] = check convertMessagesToVertexAiContents(messages);
 
         VertexAiGenerationConfig generationConfig = {maxOutputTokens: self.maxTokens};
@@ -434,21 +458,18 @@ public isolated distinct client class ModelProvider {
             requestPayload["tools"] = mapToVertexAiTools(tools).toJson();
         }
 
-        http:Response|error response = self.vertexAiClient->post(path, requestPayload, headers);
-        if response is error {
-            return buildHttpError(response);
+        stream<http:SseEvent, error?>|ai:Error sseStream =
+            openSseStream(self.vertexAiClient, path, requestPayload, headers);
+        if sseStream is ai:Error {
+            return sseStream;
         }
-        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
-        if sseStream is error {
-            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
-        }
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream));
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new GeminiChunkIterator(sseStream, span));
         return chunkStream;
     }
 
     private function chatStreamAnthropic(ai:ChatMessage[]|ai:ChatUserMessage messages,
-            ai:ChatCompletionFunctions[] tools, string? stop,
-            string path, map<string> headers) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+            ai:ChatCompletionFunctions[] tools, string? stop, string path, map<string> headers,
+            observe:ChatSpan span) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
         var [anthropicMessages, systemPrompt] = check convertMessagesToAnthropicMessages(messages);
 
         AnthropicTool[] anthropicTools = mapToAnthropicTools(tools);
@@ -457,21 +478,18 @@ public isolated distinct client class ModelProvider {
             self.maxTokens, self.temperature, stop);
         requestPayload["stream"] = true;
 
-        http:Response|error response = self.vertexAiClient->post(path, requestPayload, headers);
-        if response is error {
-            return buildHttpError(response);
+        stream<http:SseEvent, error?>|ai:Error sseStream =
+            openSseStream(self.vertexAiClient, path, requestPayload, headers);
+        if sseStream is ai:Error {
+            return sseStream;
         }
-        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
-        if sseStream is error {
-            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
-        }
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new AnthropicChunkIterator(sseStream));
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new AnthropicChunkIterator(sseStream, span));
         return chunkStream;
     }
 
     private function chatStreamOpenAiCompat(ai:ChatMessage[]|ai:ChatUserMessage messages,
-            ai:ChatCompletionFunctions[] tools, string? stop,
-            string path, map<string> headers) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+            ai:ChatCompletionFunctions[] tools, string? stop, string path, map<string> headers,
+            observe:ChatSpan span) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
         MistralMessage[]|ai:Error mistralMessages = convertMessagesToMistralMessages(messages);
         if mistralMessages is ai:Error {
             return mistralMessages;
@@ -483,40 +501,59 @@ public isolated distinct client class ModelProvider {
             modelId, mistralMessages, mistralTools, (),
             self.maxTokens, self.temperature, stop);
         requestPayload["stream"] = true;
+        // Both the open-models `openapi/chat/completions` endpoint and Mistral's
+        // `:streamRawPredict` follow the OpenAI streaming spec, which omits `usage`
+        // from a streamed response unless usage reporting is explicitly requested.
+        requestPayload["stream_options"] = {"include_usage": true};
 
-        http:Response|error response = self.vertexAiClient->post(path, requestPayload, headers);
-        if response is error {
-            return buildHttpError(response);
+        stream<http:SseEvent, error?>|ai:Error sseStream =
+            openSseStream(self.vertexAiClient, path, requestPayload, headers);
+        if sseStream is ai:Error {
+            return sseStream;
         }
-        stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
-        if sseStream is error {
-            return error ai:Error("Failed to open the SSE stream from the model", sseStream);
-        }
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new OpenAiCompatChunkIterator(sseStream));
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new OpenAiCompatChunkIterator(sseStream, span));
         return chunkStream;
     }
 }
 
 # Iterator that converts Vertex AI Gemini's Server-Sent Event stream into a stream of
 # normalized `ai:ChatCompletionChunk` values. Each `data:` line is parsed as a partial
-# `VertexAiResponse` and mapped via `toAiChunkGemini`; blank lines and unparseable
-# keep-alive comments are skipped. Gemini has no `[DONE]` sentinel — the stream simply
-# closes when generation finishes.
+# `VertexAiResponse` and mapped via `toAiChunkGemini`; blank lines are skipped and the
+# chat span is closed once the stream is done. Gemini has no `[DONE]` sentinel - the
+# stream simply closes when generation finishes.
+#
+# A frame that cannot be parsed is reported as an error rather than skipped: Vertex emits
+# `{"error": {...}}` mid-stream when a generation is cut short, and skipping it would end
+# the stream silently, handing the caller a truncated answer that looks complete. That
+# frame also parses cleanly into the open `VertexAiResponse` record, so it is detected
+# explicitly before the chunk is bound.
+#
+# The running tool-call index is held here rather than in the mapping function: the
+# `ai:ToolCallChunk.index` contract identifies a call across the whole stream, so a
+# per-chunk counter would give two function calls arriving in separate events the same
+# index and a consumer accumulating by index would concatenate their arguments.
 class GeminiChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
+    private observe:ChatSpan span;
+    private boolean done = false;
+    private int nextToolCallIndex = 0;
 
-    isolated function init(stream<http:SseEvent, error?> sseStream) {
+    isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
         self.sseStream = sseStream;
+        self.span = span;
     }
 
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if self.isDone() {
+            return ();
+        }
         while true {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
             if event is () {
-                return ();
+                return self.finish();
             }
             if event is error {
-                return error ai:Error("Error while reading the model stream", event);
+                return self.failStream(error ai:LlmConnectionError("Error while reading the model stream", event));
             }
             string? data = event.value.data;
             if data is () {
@@ -528,22 +565,81 @@ class GeminiChunkIterator {
             }
             json|error payload = trimmedData.fromJsonString();
             if payload is error {
-                continue;
+                return self.failStream(error ai:LlmInvalidResponseError(
+                        "Invalid or malformed chunk received from the model", payload));
+            }
+            string? errorMessage = extractStreamErrorFrame(payload);
+            if errorMessage is string {
+                return self.failStream(
+                        error ai:LlmError(string `Error received mid-stream from the model: ${errorMessage}`));
             }
             VertexAiResponse|error wireChunk = payload.cloneWithType();
             if wireChunk is error {
-                continue;
+                return self.failStream(error ai:LlmInvalidResponseError(
+                        "Unexpected chunk shape received from the model", wireChunk));
             }
-            return {value: toAiChunkGemini(wireChunk)};
+            var [chunk, nextIndex] = toAiChunkGemini(wireChunk, self.getNextToolCallIndex());
+            self.setNextToolCallIndex(nextIndex);
+            self.recordChunk(chunk);
+            return {value: chunk};
         }
     }
 
     public isolated function close() returns ai:Error? {
+        if !self.markDone() {
+            self.span.close();
+        }
         error? result = self.sseStream.close();
         if result is error {
-            return error ai:Error("Error while closing the model stream", result);
+            return error ai:LlmConnectionError("Error while closing the model stream", result);
         }
         return ();
+    }
+
+    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
+        recordChunkOnSpan(self.span, chunk);
+    }
+
+    private isolated function finish() returns () {
+        if !self.markDone() {
+            self.span.close();
+        }
+        return ();
+    }
+
+    // Ends the stream with an error, closing the span exactly once.
+    private isolated function failStream(ai:Error err) returns ai:Error {
+        if !self.markDone() {
+            self.span.close(err);
+        }
+        return err;
+    }
+
+    private isolated function getNextToolCallIndex() returns int {
+        lock {
+            return self.nextToolCallIndex;
+        }
+    }
+
+    private isolated function setNextToolCallIndex(int index) {
+        lock {
+            self.nextToolCallIndex = index;
+        }
+    }
+
+    private isolated function isDone() returns boolean {
+        lock {
+            return self.done;
+        }
+    }
+
+    // Marks the stream as done, returning whether it was already marked before this call.
+    private isolated function markDone() returns boolean {
+        lock {
+            boolean wasDone = self.done;
+            self.done = true;
+            return wasDone;
+        }
     }
 }
 
@@ -551,23 +647,35 @@ class GeminiChunkIterator {
 # stream into a stream of normalized `ai:ChatCompletionChunk` values. Each event is parsed
 # into an `AnthropicStreamEvent` and mapped via `toAiChunkAnthropicEvent`; the prompt token
 # count captured from `message_start` is threaded through so the `message_delta` chunk can
-# report full usage. The stream ends on `message_stop` or when the underlying SSE stream closes.
+# report full usage. The stream ends on `message_stop` or when the underlying SSE stream
+# closes, and the chat span is closed once it does.
+#
+# An `error` event carries the failure Anthropic reports mid-stream (an overload, an
+# aborted generation); its `type` and `message` are surfaced so an overload is
+# distinguishable from an invalid request. Unparseable frames are likewise reported
+# rather than skipped, so a cut-short generation never looks like a clean finish.
 class AnthropicChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
+    private observe:ChatSpan span;
+    private boolean done = false;
     private int? promptTokens = ();
 
-    isolated function init(stream<http:SseEvent, error?> sseStream) {
+    isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
         self.sseStream = sseStream;
+        self.span = span;
     }
 
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if self.isDone() {
+            return ();
+        }
         while true {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
             if event is () {
-                return ();
+                return self.finish();
             }
             if event is error {
-                return error ai:Error("Error while reading the model stream", event);
+                return self.failStream(error ai:LlmConnectionError("Error while reading the model stream", event));
             }
             string? data = event.value.data;
             if data is () {
@@ -579,34 +687,87 @@ class AnthropicChunkIterator {
             }
             json|error payload = trimmedData.fromJsonString();
             if payload is error {
-                continue;
+                return self.failStream(error ai:LlmInvalidResponseError(
+                        "Invalid or malformed chunk received from the model", payload));
             }
             AnthropicStreamEvent|error wireEvent = payload.cloneWithType();
             if wireEvent is error {
-                continue;
+                return self.failStream(error ai:LlmInvalidResponseError(
+                        "Unexpected chunk shape received from the model", wireEvent));
             }
             if wireEvent.'type == "error" {
-                return error ai:Error("Error event received from the Anthropic stream");
+                return self.failStream(error ai:LlmError(
+                        string `Error received mid-stream from the model: ${describeAnthropicStreamError(wireEvent)}`));
             }
             if wireEvent.'type == "message_start" {
-                self.promptTokens = wireEvent.message?.usage?.input_tokens;
+                self.setPromptTokens(wireEvent.message?.usage?.input_tokens);
             }
-            ai:ChatCompletionChunk? chunk = toAiChunkAnthropicEvent(wireEvent, self.promptTokens);
+            ai:ChatCompletionChunk? chunk = toAiChunkAnthropicEvent(wireEvent, self.getPromptTokens());
             if chunk is ai:ChatCompletionChunk {
+                self.recordChunk(chunk);
                 return {value: chunk};
             }
             if wireEvent.'type == "message_stop" {
-                return ();
+                return self.finish();
             }
         }
     }
 
     public isolated function close() returns ai:Error? {
+        if !self.markDone() {
+            self.span.close();
+        }
         error? result = self.sseStream.close();
         if result is error {
-            return error ai:Error("Error while closing the model stream", result);
+            return error ai:LlmConnectionError("Error while closing the model stream", result);
         }
         return ();
+    }
+
+    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
+        recordChunkOnSpan(self.span, chunk);
+    }
+
+    private isolated function finish() returns () {
+        if !self.markDone() {
+            self.span.close();
+        }
+        return ();
+    }
+
+    // Ends the stream with an error, closing the span exactly once.
+    private isolated function failStream(ai:Error err) returns ai:Error {
+        if !self.markDone() {
+            self.span.close(err);
+        }
+        return err;
+    }
+
+    private isolated function getPromptTokens() returns int? {
+        lock {
+            return self.promptTokens;
+        }
+    }
+
+    private isolated function setPromptTokens(int? promptTokens) {
+        lock {
+            self.promptTokens = promptTokens;
+        }
+    }
+
+    private isolated function isDone() returns boolean {
+        lock {
+            return self.done;
+        }
+    }
+
+    // Marks the stream as done, returning whether it was already marked before this call.
+    private isolated function markDone() returns boolean {
+        lock {
+            boolean wasDone = self.done;
+            self.done = true;
+            return wasDone;
+        }
     }
 }
 
@@ -614,22 +775,31 @@ class AnthropicChunkIterator {
 # Mistral `:streamRawPredict` endpoint and the open-models `openapi/chat/completions`
 # endpoint) into a stream of normalized `ai:ChatCompletionChunk` values. Each `data:` line is
 # parsed into the wire chunk and mapped via `toAiChunkOpenAiCompat`; the terminating `[DONE]`
-# sentinel, blank lines, and unparseable keep-alive comments are skipped.
+# sentinel ends the stream, blank lines are skipped, and the chat span is closed once done.
+#
+# A frame that cannot be parsed is reported as an error rather than skipped, so a
+# generation cut short mid-stream never reaches the caller as a clean, truncated answer.
 class OpenAiCompatChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
+    private observe:ChatSpan span;
+    private boolean done = false;
 
-    isolated function init(stream<http:SseEvent, error?> sseStream) {
+    isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
         self.sseStream = sseStream;
+        self.span = span;
     }
 
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if self.isDone() {
+            return ();
+        }
         while true {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
             if event is () {
-                return ();
+                return self.finish();
             }
             if event is error {
-                return error ai:Error("Error while reading the model stream", event);
+                return self.failStream(error ai:LlmConnectionError("Error while reading the model stream", event));
             }
             string? data = event.value.data;
             if data is () {
@@ -640,25 +810,98 @@ class OpenAiCompatChunkIterator {
                 continue;
             }
             if trimmedData == "[DONE]" {
-                return ();
+                return self.finish();
             }
             json|error payload = trimmedData.fromJsonString();
             if payload is error {
-                continue;
+                return self.failStream(error ai:LlmInvalidResponseError(
+                        "Invalid or malformed chunk received from the model", payload));
+            }
+            string? errorMessage = extractStreamErrorFrame(payload);
+            if errorMessage is string {
+                return self.failStream(
+                        error ai:LlmError(string `Error received mid-stream from the model: ${errorMessage}`));
             }
             MistralStreamChunk|error wireChunk = payload.cloneWithType();
             if wireChunk is error {
-                continue;
+                return self.failStream(error ai:LlmInvalidResponseError(
+                        "Unexpected chunk shape received from the model", wireChunk));
             }
-            return {value: toAiChunkOpenAiCompat(wireChunk)};
+            ai:ChatCompletionChunk chunk = toAiChunkOpenAiCompat(wireChunk);
+            self.recordChunk(chunk);
+            return {value: chunk};
         }
     }
 
     public isolated function close() returns ai:Error? {
+        if !self.markDone() {
+            self.span.close();
+        }
         error? result = self.sseStream.close();
         if result is error {
-            return error ai:Error("Error while closing the model stream", result);
+            return error ai:LlmConnectionError("Error while closing the model stream", result);
         }
         return ();
+    }
+
+    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
+        recordChunkOnSpan(self.span, chunk);
+    }
+
+    private isolated function finish() returns () {
+        if !self.markDone() {
+            self.span.close();
+        }
+        return ();
+    }
+
+    // Ends the stream with an error, closing the span exactly once.
+    private isolated function failStream(ai:Error err) returns ai:Error {
+        if !self.markDone() {
+            self.span.close(err);
+        }
+        return err;
+    }
+
+    private isolated function isDone() returns boolean {
+        lock {
+            return self.done;
+        }
+    }
+
+    // Marks the stream as done, returning whether it was already marked before this call.
+    private isolated function markDone() returns boolean {
+        lock {
+            boolean wasDone = self.done;
+            self.done = true;
+            return wasDone;
+        }
+    }
+}
+
+# Records the finish reason and token usage a completed streaming chunk carries onto the
+# chat span, so streamed generations report the same trace attributes as `chat()` does.
+#
+# + span - The chat span for the streaming request
+# + chunk - The normalized chunk just yielded to the caller
+isolated function recordChunkOnSpan(observe:ChatSpan span, ai:ChatCompletionChunk chunk) {
+    ai:ChatCompletionChunkChoice[] choices = chunk.choices;
+    if choices.length() > 0 {
+        ai:FinishReason? finishReason = choices[0].finishReason;
+        if finishReason is ai:FinishReason {
+            span.addFinishReason(finishReason);
+            span.addOutputType(observe:TEXT);
+        }
+    }
+    ai:CompletionTokenUsage? usage = chunk?.usage;
+    if usage is ai:CompletionTokenUsage {
+        int? promptTokens = usage?.promptTokens;
+        if promptTokens is int {
+            span.addInputTokenCount(promptTokens);
+        }
+        int? completionTokens = usage?.completionTokens;
+        if completionTokens is int {
+            span.addOutputTokenCount(completionTokens);
+        }
     }
 }

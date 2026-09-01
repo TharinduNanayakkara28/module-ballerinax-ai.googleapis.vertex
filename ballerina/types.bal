@@ -165,9 +165,13 @@ type VertexAiFunctionResponse record {
 };
 
 # Represents a content object containing a role and one or more parts.
+# `role` and `parts` are optional because some Vertex AI Gemini responses
+# (observed on gemini-2.5-flash-lite's non-streaming generateContent, likely
+# for an empty/filtered candidate) omit one or both on the returned candidate
+# content; the connector always supplies both when building a request.
 type VertexAiContent record {
-    string role;
-    VertexAiPart[] parts;
+    string role?;
+    VertexAiPart[] parts?;
 };
 
 # Represents the systemInstruction field in a Vertex AI request.
@@ -353,6 +357,7 @@ type MistralChoice record {
 type MistralUsage record {
     int prompt_tokens?;
     int completion_tokens?;
+    int total_tokens?;
 };
 
 # The Mistral rawPredict response body.
@@ -381,6 +386,15 @@ type ChatResult record {|
 // the fields that are only present on some event types.
 
 # A single SSE event from the Anthropic Messages API stream, discriminated by `type`.
+#
+# + type - The event type: `message_start`, `content_block_start`, `content_block_delta`,
+#          `content_block_stop`, `message_delta`, `message_stop`, `ping`, or `error`
+# + message - The message snapshot; present on `message_start`
+# + index - Index of the content block this event applies to
+# + content_block - The content block being opened; present on `content_block_start`
+# + delta - The incremental content or stop reason; present on the `*_delta` events
+# + usage - Output token usage; present on `message_delta`
+# + error - The failure detail; present on `error`
 type AnthropicStreamEvent record {
     string 'type;
     AnthropicStreamMessage message?;
@@ -388,15 +402,34 @@ type AnthropicStreamEvent record {
     AnthropicStreamContentBlock content_block?;
     AnthropicStreamDelta delta?;
     AnthropicUsage usage?;
+    AnthropicStreamError 'error?;
+};
+
+# The failure carried by an `error` event, which Anthropic emits mid-stream when a
+# generation is aborted. `type` distinguishes a retryable `overloaded_error` from a
+# terminal `invalid_request_error`, so both fields are surfaced to the caller.
+#
+# + type - The Anthropic error type, e.g. `overloaded_error` or `invalid_request_error`
+# + message - The human-readable failure detail
+type AnthropicStreamError record {
+    string 'type?;
+    string message?;
 };
 
 # The message snapshot carried by a `message_start` event.
+#
+# + id - Unique identifier for the message; stable across all events of one response
+# + usage - Prompt token usage, known as soon as the message starts
 type AnthropicStreamMessage record {
     string id?;
     AnthropicUsage usage?;
 };
 
 # The content block carried by a `content_block_start` event.
+#
+# + type - The block type, `text` or `tool_use`
+# + id - Identifier of the tool call; present on a `tool_use` block
+# + name - Name of the function to call; present on a `tool_use` block
 type AnthropicStreamContentBlock record {
     string 'type;
     string id?;
@@ -405,6 +438,11 @@ type AnthropicStreamContentBlock record {
 
 # The delta carried by `content_block_delta` (text_delta/input_json_delta) or
 # `message_delta` (stop_reason) events.
+#
+# + type - The delta type, `text_delta` or `input_json_delta`
+# + text - The answer text fragment; present on a `text_delta`
+# + partial_json - Incremental JSON fragment of the tool arguments; present on an `input_json_delta`
+# + stop_reason - Reason the model stopped generating; present on `message_delta`
 type AnthropicStreamDelta record {
     string 'type?;
     string text?;
@@ -418,13 +456,22 @@ type AnthropicStreamDelta record {
 // `chat.completion.chunk` SSE events.
 
 # A single streamed chunk in the OpenAI-compatible `chat.completion.chunk` shape.
+#
+# + id - Unique identifier for the completion; stable across all chunks of one response
+# + choices - The streamed choices for this chunk; absent or empty on the final usage-only
+#             chunk emitted when `stream_options: { include_usage: true }` is set
+# + usage - Token usage statistics; present only on the final chunk
 type MistralStreamChunk record {
     string id?;
-    MistralStreamChoice[] choices;
+    MistralStreamChoice[] choices?;
     MistralUsage usage?;
 };
 
 # A single choice within a streamed OpenAI-compatible chunk.
+#
+# + index - Index of the choice in the list of choices
+# + delta - The incremental message content for this chunk
+# + finish_reason - Reason the model stopped generating tokens; absent until the final chunk
 type MistralStreamChoice record {
     int index?;
     MistralChunkDelta delta;
@@ -432,6 +479,10 @@ type MistralStreamChoice record {
 };
 
 # The incremental message delta for a streamed OpenAI-compatible choice.
+#
+# + role - Role of the author of this message; only sent on the first delta
+# + content - The answer text fragment for this chunk
+# + tool_calls - Incremental tool call fragments produced by the model
 type MistralChunkDelta record {
     string role?;
     string? content?;
@@ -439,6 +490,11 @@ type MistralChunkDelta record {
 };
 
 # An incremental tool call fragment within a streamed OpenAI-compatible delta.
+#
+# + index - Index used to accumulate fragments of the same tool call across chunks
+# + id - Identifier of the tool call; only sent on the first fragment of the call
+# + type - The tool call type; always `"function"` for the endpoints this module targets
+# + function - The function name/arguments fragment
 type MistralToolCallChunk record {
     int index;
     string id?;
@@ -447,6 +503,9 @@ type MistralToolCallChunk record {
 };
 
 # The function name/arguments fragment of a streamed OpenAI-compatible tool call.
+#
+# + name - Name of the function to call; only sent on the first fragment of the call
+# + arguments - Incremental JSON-string fragment of the function arguments
 type MistralFunctionChunk record {
     string name?;
     string arguments?;
@@ -458,12 +517,19 @@ type MistralFunctionChunk record {
 
 # Maps a Vertex AI Gemini streamed chunk onto the normalized `ai:ChatCompletionChunk`.
 # Gemini does not fragment function-call arguments across chunks the way OpenAI/Anthropic
-# do, so each function-call part gets its own index within the chunk.
+# do, so every function-call part carries its complete arguments.
+#
+# The tool-call index runs across the whole stream rather than restarting per chunk:
+# `ai:ToolCallChunk.index` identifies one call for a consumer accumulating fragments, so
+# two function calls arriving in separate events must not both be reported as index 0.
 #
 # + w - The parsed Gemini streaming wire chunk (one SSE event)
-# + return - The normalized chunk consumed by the `ai` module
-isolated function toAiChunkGemini(VertexAiResponse w) returns ai:ChatCompletionChunk {
+# + startToolCallIndex - The tool-call index to assign to the first function call in this chunk
+# + return - The normalized chunk, and the tool-call index the next chunk should start from
+isolated function toAiChunkGemini(VertexAiResponse w, int startToolCallIndex = 0)
+        returns [ai:ChatCompletionChunk, int] {
     ai:ChatCompletionChunkChoice[] choices = [];
+    int nextToolCallIndex = startToolCallIndex;
     VertexAiCandidate[]? candidates = w.candidates;
     if candidates is VertexAiCandidate[] {
         foreach VertexAiCandidate c in candidates {
@@ -471,8 +537,7 @@ isolated function toAiChunkGemini(VertexAiResponse w) returns ai:ChatCompletionC
             ai:ToolCallChunk[] toolCalls = [];
             VertexAiContent? content = c.content;
             if content is VertexAiContent {
-                int idx = 0;
-                foreach VertexAiPart part in content.parts {
+                foreach VertexAiPart part in content.parts ?: [] {
                     string? text = part.text;
                     if text is string {
                         textAccumulator += text;
@@ -480,14 +545,17 @@ isolated function toAiChunkGemini(VertexAiResponse w) returns ai:ChatCompletionC
                     VertexAiFunctionCall? fc = part.functionCall;
                     if fc is VertexAiFunctionCall {
                         toolCalls.push({
-                            index: idx,
+                            index: nextToolCallIndex,
                             'function: {name: fc.name, arguments: (fc.args ?: {}).toJsonString()}
                         });
-                        idx += 1;
+                        nextToolCallIndex += 1;
                     }
                 }
             }
-            ai:ChatCompletionChunkDelta delta = {content: textAccumulator.length() > 0 ? textAccumulator : ()};
+            ai:ChatCompletionChunkDelta delta = {
+                role: ai:ASSISTANT,
+                content: textAccumulator.length() > 0 ? textAccumulator : ()
+            };
             if toolCalls.length() > 0 {
                 delta.toolCalls = toolCalls;
             }
@@ -516,7 +584,7 @@ isolated function toAiChunkGemini(VertexAiResponse w) returns ai:ChatCompletionC
             totalTokens: usage.totalTokenCount
         };
     }
-    return chunk;
+    return [chunk, nextToolCallIndex];
 }
 
 # Safely maps a Gemini `finishReason` string onto the `ai:FinishReason` enum.
@@ -591,11 +659,13 @@ isolated function toAiChunkAnthropicEvent(AnthropicStreamEvent event, int? promp
         ai:ChatCompletionChunk chunk = {choices: [{index: 0, delta: {}, finishReason}]};
         int? completionTokens = event.usage?.output_tokens;
         if promptTokens is int || completionTokens is int {
-            chunk.usage = {
-                promptTokens,
-                completionTokens,
-                totalTokens: (promptTokens ?: 0) + (completionTokens ?: 0)
-            };
+            // A total is only reported when both halves are known - summing with a
+            // zero stand-in would hand the caller a plausible but wrong figure.
+            ai:CompletionTokenUsage usage = {promptTokens, completionTokens};
+            if promptTokens is int && completionTokens is int {
+                usage.totalTokens = promptTokens + completionTokens;
+            }
+            chunk.usage = usage;
         }
         return chunk;
     }
@@ -605,6 +675,31 @@ isolated function toAiChunkAnthropicEvent(AnthropicStreamEvent event, int? promp
     }
     // content_block_stop, message_stop, ping, and any other lifecycle events carry no data.
     return ();
+}
+
+# Renders an Anthropic `error` stream event as a human-readable detail, keeping the
+# `type` alongside the message so a retryable `overloaded_error` stays distinguishable
+# from a terminal `invalid_request_error`.
+#
+# + event - The parsed `error` stream event
+# + return - The failure detail to report to the caller
+isolated function describeAnthropicStreamError(AnthropicStreamEvent event) returns string {
+    AnthropicStreamError? failure = event?.'error;
+    if failure is () {
+        return "unknown error";
+    }
+    string? errorType = failure?.'type;
+    string? message = failure?.message;
+    if errorType is string && message is string {
+        return string `${errorType}: ${message}`;
+    }
+    if message is string {
+        return message;
+    }
+    if errorType is string {
+        return errorType;
+    }
+    return "unknown error";
 }
 
 # Safely maps an Anthropic `stop_reason` onto the `ai:FinishReason` enum.
@@ -635,7 +730,7 @@ isolated function mapAnthropicStopReason(string? stopReason) returns ai:FinishRe
 # + return - The normalized chunk consumed by the `ai` module
 isolated function toAiChunkOpenAiCompat(MistralStreamChunk w) returns ai:ChatCompletionChunk {
     ai:ChatCompletionChunkChoice[] choices = [];
-    foreach MistralStreamChoice c in w.choices {
+    foreach MistralStreamChoice c in w.choices ?: [] {
         ai:ChatCompletionChunkDelta delta = {content: c.delta?.content};
         ai:ROLE? role = mapRole(c.delta?.role);
         if role is ai:ROLE {
@@ -677,7 +772,15 @@ isolated function toAiChunkOpenAiCompat(MistralStreamChunk w) returns ai:ChatCom
     }
     MistralUsage? usage = w.usage;
     if usage is MistralUsage {
-        chunk.usage = {promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens};
+        ai:CompletionTokenUsage mappedUsage = {
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens
+        };
+        int? totalTokens = usage.total_tokens;
+        if totalTokens is int {
+            mappedUsage.totalTokens = totalTokens;
+        }
+        chunk.usage = mappedUsage;
     }
     return chunk;
 }

@@ -31,7 +31,7 @@ import io.ballerina.runtime.api.values.BTypedesc;
  * {@code generateLlmResponseStream} helper, where the type gating and stream
  * construction logic lives.
  *
- * @since 1.1.0
+ * @since 1.0.1
  */
 public class StreamGenerator {
     public static Object generateStream(Environment env, BObject modelProvider,

@@ -153,6 +153,21 @@ isolated function buildVertexAiAssistantContent(ai:ChatAssistantMessage message)
 
 // ── Response parsing ──────────────────────────────────────────────────────────
 
+# Describes an empty Vertex AI candidate, folding in the `finishReason` when the model
+# supplied one. A part-less candidate almost always means the generation was cut short
+# (`MAX_TOKENS`) or filtered (`SAFETY`, `PROHIBITED_CONTENT`), and that reason is the only
+# thing that tells the caller which it was.
+#
+# + candidate - The candidate that carried no usable content
+# + return - The error message to report
+isolated function buildEmptyCandidateMessage(VertexAiCandidate candidate) returns string {
+    string? finishReason = candidate.finishReason;
+    if finishReason is string {
+        return string `Empty response from the Vertex AI model (finishReason: ${finishReason})`;
+    }
+    return "Empty response from the Vertex AI model";
+}
+
 # Builds an ai:ChatAssistantMessage from the Vertex AI response.
 isolated function buildChatAssistantMessage(VertexAiResponse response) returns ai:ChatAssistantMessage|ai:Error {
     VertexAiCandidate[]? candidates = response.candidates;
@@ -163,9 +178,17 @@ isolated function buildChatAssistantMessage(VertexAiResponse response) returns a
     VertexAiCandidate candidate = candidates[0];
     VertexAiContent? candidateContent = candidate.content;
     if candidateContent is () {
-        return error ai:LlmInvalidResponseError("Empty response from the Vertex AI model");
+        return error ai:LlmInvalidResponseError(buildEmptyCandidateMessage(candidate));
     }
-    VertexAiPart[] parts = candidateContent.parts;
+    // A candidate can come back with no `parts` at all - observed on gemini-2.5-flash-lite
+    // when the candidate is empty or filtered. That is a failed generation, not an empty
+    // answer, and `generate()` already reports it as one; reporting it here too keeps
+    // `chat()` from handing back a silently blank assistant message.
+    VertexAiPart[]? candidateParts = candidateContent.parts;
+    if candidateParts is () || candidateParts.length() == 0 {
+        return error ai:LlmInvalidResponseError(buildEmptyCandidateMessage(candidate));
+    }
+    VertexAiPart[] parts = candidateParts;
 
     ai:FunctionCall[] functionCalls = [];
     string textAccumulator = "";
@@ -410,7 +433,7 @@ isolated function generateLlmResponse(http:Client vertexAiClient, string accessT
         if candidates is VertexAiCandidate[] && candidates.length() > 0 {
             VertexAiContent? responseContent = candidates[0].content;
             if responseContent is VertexAiContent {
-                foreach VertexAiPart part in responseContent.parts {
+                foreach VertexAiPart part in responseContent.parts ?: [] {
                     VertexAiFunctionCall? fc = part.functionCall;
                     if fc is VertexAiFunctionCall && fc.name == GET_RESULTS_TOOL {
                         functionCallResult = fc;
@@ -683,6 +706,89 @@ class ChunkTextIterator {
             }
         }
     }
+
+    public isolated function close() returns ai:Error? {
+        return self.chunks.close();
+    }
+}
+
+# Opens a Server-Sent Event stream against a Vertex AI streaming endpoint.
+#
+# The POST binds to `http:Response` because the payload has to be read as an event stream
+# rather than data-bound, and that also switches off the client's status-code error
+# mapping - so the status is checked here. Without it Vertex AI's own message for an
+# expired token, a rate limit, a wrong model id, or a rejected parameter is discarded and
+# the caller is told only that the stream could not be opened.
+#
+# + vertexAiClient - The HTTP client for the Vertex AI endpoint
+# + path - The endpoint path to post to
+# + payload - The request payload
+# + headers - The request headers
+# + return - The SSE event stream, or an `ai:Error` describing the failure
+isolated function openSseStream(http:Client vertexAiClient, string path, map<json> payload,
+        map<string> headers) returns stream<http:SseEvent, error?>|ai:Error {
+    http:Response|error response = vertexAiClient->post(path, payload, headers);
+    if response is error {
+        return buildHttpError(response);
+    }
+    int statusCode = response.statusCode;
+    if statusCode < 200 || statusCode >= 300 {
+        string? detail = extractHttpErrorDetail(response);
+        string message = detail is string
+            ? string `Vertex AI rejected the streaming request with HTTP ${statusCode}: ${detail}`
+            : string `Vertex AI rejected the streaming request with HTTP ${statusCode}`;
+        return error ai:LlmConnectionError(message);
+    }
+    stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+    if sseStream is error {
+        return error ai:LlmConnectionError("Failed to open the SSE stream from the model", sseStream);
+    }
+    return sseStream;
+}
+
+# Pulls the human-readable detail out of a non-2xx streaming response, which carries the
+# usual Vertex AI `{"error": {"message": ...}}` body rather than an event stream.
+#
+# + response - The non-2xx response
+# + return - The failure detail, or `()` when the body carries none
+isolated function extractHttpErrorDetail(http:Response response) returns string? {
+    json|error payload = response.getJsonPayload();
+    if payload is error {
+        string|error text = response.getTextPayload();
+        if text is string && text.trim() != "" {
+            return text.trim();
+        }
+        return ();
+    }
+    string? frameMessage = extractStreamErrorFrame(payload);
+    if frameMessage is string {
+        return frameMessage;
+    }
+    return payload.toJsonString();
+}
+
+# Detects a Vertex AI `{"error": {...}}` frame in a streamed payload and returns its
+# message. Vertex emits such a frame mid-stream when a generation is cut short (quota
+# exhausted, token expiry, a safety abort), and it parses cleanly into the open wire
+# records - so it has to be recognised explicitly rather than left to `cloneWithType`.
+#
+# + payload - The parsed SSE `data` payload
+# + return - The error message, or `()` when the payload is not an error frame
+isolated function extractStreamErrorFrame(json payload) returns string? {
+    if payload !is map<json> {
+        return ();
+    }
+    json? failure = payload["error"];
+    if failure is () {
+        return ();
+    }
+    if failure is map<json> {
+        json? message = failure["message"];
+        if message is string {
+            return message;
+        }
+    }
+    return failure.toJsonString();
 }
 
 isolated function buildHttpError(error httpError) returns ai:LlmConnectionError {

@@ -105,7 +105,47 @@ Sentiment|error result = vertexModel->generate(
 );
 ```
 
-### Step 5: Use an embedding provider
+### Step 5: Stream a chat completion
+
+`chatStream` returns the response incrementally, as normalized `ai:ChatCompletionChunk`
+values. It works across every supported publisher - Gemini, Anthropic, Mistral, and the
+open-models endpoint - each publisher's native event format is mapped onto the same shape.
+
+```ballerina
+stream<ai:ChatCompletionChunk, ai:Error?> chunks =
+    check vertexModel->chatStream([{role: "user", content: "Write a haiku about Colombo"}]);
+
+check from ai:ChatCompletionChunk chunk in chunks
+    do {
+        string? fragment = chunk.choices[0].delta.content;
+        if fragment is string {
+            io:print(fragment);
+        }
+    };
+```
+
+Closing the stream early releases the underlying HTTP connection:
+
+```ballerina
+check chunks.close();
+```
+
+### Step 6: Stream generated text
+
+`generateStream` streams just the answer text, skipping tool-call and usage-only chunks.
+Only `string` is supported - a partial generation is a valid value only for `string`, so
+use `generate` for structured types.
+
+```ballerina
+stream<string, ai:Error?> fragments = check vertexModel->generateStream(`Explain SSE in one paragraph`);
+
+check from string fragment in fragments
+    do {
+        io:print(fragment);
+    };
+```
+
+### Step 7: Use an embedding provider
 
 ```ballerina
 import ballerina/ai;
